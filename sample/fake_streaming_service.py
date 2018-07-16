@@ -4,6 +4,8 @@ from __future__ import absolute_import
 import base64
 from functools import wraps
 import json
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -13,6 +15,7 @@ import ssl
 import string
 import sys
 import threading
+import time
 
 try:
     from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -28,7 +31,7 @@ except ImportError:
 DEFAULT_PORT = 50080
 LOG_LEVEL = logging.INFO
 USE_SSL = False
-REQUESTS_PER_TOKEN = 25
+TOKEN_LIFETIME = 60 # seconds
 RUN_CHECK_WAIT = 5
 MAX_SHUTDOWN_WAIT = 10
 
@@ -45,6 +48,10 @@ CONSUMER_GROUP = "sample_consumer_group"
 
 PARTITION = 1
 INITIAL_OFFSET = 100
+
+JWT_KEY = "fake_jwt_key"
+TENANT_ID = "12345"
+
 
 def encode_payload(obj):
     return base64.b64encode(json.dumps(obj).encode()).decode()
@@ -137,7 +144,8 @@ def consumer_service_handler(consumer_service):
                 "^/identity/v1/login$": {"GET": _login},
                 create_consumer_service_path("consumers/[^/]+/records"):
                     {"GET": _get_records},
-                create_consumer_service_path("consumers"): {"POST": _create_consumer},
+                create_consumer_service_path("consumers"): {
+                    "POST": _create_consumer},
                 create_consumer_service_path("consumers/[^/]+/subscription"):
                     {"POST": _create_subscription},
                 create_consumer_service_path("consumers/[^/]+/offsets"):
@@ -195,10 +203,10 @@ def consumer_service_handler(consumer_service):
         def do_GET(self):
             self._handle_request("GET")
 
-        def do_POST(self): # pylint: disable=invalid-name
+        def do_POST(self):  # pylint: disable=invalid-name
             self._handle_request("POST")
 
-        def do_DELETE(self): # pylint: disable=invalid-name
+        def do_DELETE(self):  # pylint: disable=invalid-name
             self._handle_request("DELETE")
 
     return ConsumerServiceHandler
@@ -213,7 +221,7 @@ class ConsumerService(object):
         self._server = None
         self._server_thread = None
         self._started = False
-        self._token = random_val()
+        self._token_expiration_time, self._token = generate_token()
         self._request_count = 0
         self._config = self._load_configuration(config_file)
         self._port = self._get_setting_from_config("port",
@@ -320,16 +328,16 @@ def _user_auth(f):
         else:
             response = 403, "Invalid user", {"WWW-Authenticate": "Basic"}
         return response
+
     return decorated
 
 
 def _token_auth(f):
     @wraps(f)
     def decorated(handler, consumer_service, *args, **kwargs):
-        if REQUESTS_PER_TOKEN and \
-                                consumer_service._request_count % \
-                                REQUESTS_PER_TOKEN == 0:
-            consumer_service._token = random_val()
+        if time.time() > consumer_service._token_expiration_time:
+            consumer_service._token_expiration_time, consumer_service._token = \
+                generate_token()
             response = 403, "Token expired", {"WWW-Authenticate": "Bearer"}
         elif handler.headers.get("Authorization") == \
                 "Bearer {}".format(consumer_service._token):
@@ -339,6 +347,7 @@ def _token_auth(f):
         else:
             response = 403, "Invalid token", {"WWW-Authenticate": "Bearer"}
         return response
+
     return decorated
 
 
@@ -346,9 +355,11 @@ def _json_body(f):
     @wraps(f)
     def decorated(handler, *args, **kwargs):
         kwargs['body'] = json.loads(
-            handler.rfile.read(int(handler.headers['Content-Length'])).decode())
+            handler.rfile.read(
+                int(handler.headers['Content-Length'])).decode())
         kwargs['handler'] = handler
         return f(*args, **kwargs)
+
     return decorated
 
 
@@ -376,21 +387,44 @@ def _consumer_auth(f):
                 kwargs["consumer_service"] = consumer_service
                 response = f(*args, **kwargs)
         return response
+
     return decorated
 
 
 @_user_auth
-def _login(consumer_service, **kwargs): # pylint: disable=unused-argument
+def _login(consumer_service, **kwargs):  # pylint: disable=unused-argument
     return 200, {"AuthorizationToken": consumer_service._token}
 
 
-def random_val():
+def _random_val():
     return "".join(random.choice(string.ascii_uppercase) for _ in range(5))
+
+
+def _base64_url_encode_string(str_val):
+    return base64.urlsafe_b64encode(str_val).rstrip(b"=")
+
+
+def _base64_url_encode_dict(dict_val):
+    return _base64_url_encode_string(json.dumps(dict_val))
+
+
+def generate_token():
+    expiration_time = time.time() + TOKEN_LIFETIME
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {"tenant_id": TENANT_ID, "exp": expiration_time}
+    base64_header_plus_payload = "{}.{}".format(
+        _base64_url_encode_dict(header), _base64_url_encode_dict(payload))
+    verify_signature = hmac.new(JWT_KEY, base64_header_plus_payload,
+                                digestmod=hashlib.sha256).digest()
+    return (expiration_time, "{}.{}".format(base64_header_plus_payload,
+                                            _base64_url_encode_string(
+                                                verify_signature)))
 
 
 @_token_auth
 @_consumer_auth
-def _delete_consumer(consumer_instance_id, consumer_service, **kwargs): # pylint: disable=unused-argument
+def _delete_consumer(consumer_instance_id, consumer_service,
+                     **kwargs):  # pylint: disable=unused-argument
     status_code = 204 \
         if consumer_service._active_consumers.pop(consumer_instance_id, None) \
         else 404
@@ -399,10 +433,11 @@ def _delete_consumer(consumer_instance_id, consumer_service, **kwargs): # pylint
 
 @_token_auth
 @_json_body
-def _create_consumer(body, consumer_service, **kwargs): # pylint: disable=unused-argument
+def _create_consumer(body, consumer_service,
+                     **kwargs):  # pylint: disable=unused-argument
     if body.get("consumerGroup") == CONSUMER_GROUP:
-        consumer_id = random_val()
-        cookie_value = random_val()
+        consumer_id = _random_val()
+        cookie_value = _random_val()
         with consumer_service._lock:
             consumer_info = {
                 "cookie": cookie_value,
@@ -424,7 +459,7 @@ def _create_consumer(body, consumer_service, **kwargs): # pylint: disable=unused
 def _create_subscription(body,
                          consumer_instance_id,
                          consumer_service,
-                         **kwargs): # pylint: disable=unused-argument
+                         **kwargs):  # pylint: disable=unused-argument
     status_code = 404
     response = "Consumer not found"
     with consumer_service._lock:
@@ -442,11 +477,12 @@ def _create_subscription(body,
                 response = "No topics key in subscription request body"
     return status_code, response
 
+
 @_token_auth
 @_consumer_auth
 def _get_records(consumer_instance_id,
                  consumer_service,
-                 **kwargs): # pylint: disable=unused-argument
+                 **kwargs):  # pylint: disable=unused-argument
     status_code = 404
     response = "Consumer not found"
     with consumer_service._lock:
@@ -455,16 +491,17 @@ def _get_records(consumer_instance_id,
         if consumer:
             status_code = 200
             response = {"records": \
-                [record for record in consumer_service._active_records \
-                 if record["routingData"]["topic"] \
-                 in consumer["subscribedTopics"]]}
+                            [record for record in
+                             consumer_service._active_records \
+                             if record["routingData"]["topic"] \
+                             in consumer["subscribedTopics"]]}
     return status_code, response
 
 
 def record_matches_offset(record, offset):
     return record["routingData"]["topic"] == offset["topic"] and \
-        record["partition"] == offset["partition"] and \
-        record["offset"] == offset["offset"]
+           record["partition"] == offset["partition"] and \
+           record["offset"] == offset["offset"]
 
 
 def record_in_offsets(record, offsets):
@@ -474,7 +511,8 @@ def record_in_offsets(record, offsets):
 @_token_auth
 @_consumer_auth
 @_json_body
-def _commit_offsets(body, consumer_service, **kwargs): # pylint: disable=unused-argument
+def _commit_offsets(body, consumer_service,
+                    **kwargs):  # pylint: disable=unused-argument
     committed_offsets = body.get("offsets")
     with consumer_service._lock:
         consumer_service._active_records[:] = \
@@ -484,7 +522,8 @@ def _commit_offsets(body, consumer_service, **kwargs): # pylint: disable=unused-
 
 
 @_json_body
-def _produce_record(body, consumer_service, **kwargs): # pylint: disable=unused-argument
+def _produce_record(body, consumer_service,
+                    **kwargs):  # pylint: disable=unused-argument
     status_code = 200
     response = ""
     with consumer_service._lock:
@@ -496,7 +535,8 @@ def _produce_record(body, consumer_service, **kwargs): # pylint: disable=unused-
     return status_code, response
 
 
-def _reset_records(consumer_service, **kwargs): # pylint: disable=unused-argument
+def _reset_records(consumer_service,
+                   **kwargs):  # pylint: disable=unused-argument
     with consumer_service._lock:
         consumer_service._active_records = list(DEFAULT_RECORDS)
         consumer_service._offset = \
@@ -513,10 +553,12 @@ if __name__ == "__main__":
     RUNNING = [True]
     RUN_CONDITION = threading.Condition()
 
+
     def signal_handler(*_):
         with RUN_CONDITION:
             RUNNING[0] = False
             RUN_CONDITION.notify_all()
+
 
     with ConsumerService(config_file=config_file_param):
         signal.signal(signal.SIGTERM, signal_handler)
